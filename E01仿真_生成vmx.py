@@ -3,19 +3,29 @@ from tkinter import filedialog, messagebox, ttk
 import subprocess
 import os
 import shutil
+import sys
+import re
+import threading
 from pathlib import Path
 
-# --- 配置区 ---
-# 请根据您的实际情况修改以下路径
-EWFEXPORT_PATH = r"..\ewf-tools-win64-main\ewf-tools\ewfexport.exe"  
-QEMU_IMG_PATH = r"..\Tools\qemu-img.exe"    
+# --- 自动检测工具路径（支持脚本和 exe 两种运行模式） ---
+def get_base_dir():
+    if getattr(sys, 'frozen', False):
+        return Path(sys.executable).parent
+    else:
+        return Path(__file__).parent
+
+BASE_DIR = get_base_dir()
+EWFEXPORT_PATH = str(BASE_DIR / "ewf-tools-win64-main" / "ewf-tools" / "ewfexport.exe")
+QEMU_IMG_PATH = str(BASE_DIR / "Tools" / "qemu-img.exe")
 # --- 配置区结束 ---
+
 
 class E01ConverterApp:
     def __init__(self, root):
         self.root = root
         self.root.title("E01 到 VMDK 转换器")
-        self.root.geometry("600x580")
+        self.root.geometry("600x620")
         self.root.resizable(False, False)
 
         # 样式
@@ -25,7 +35,7 @@ class E01ConverterApp:
         self.style.configure("TButton", font=("Segoe UI", 10, "bold"))
         self.style.configure("TEntry", font=("Segoe UI", 10))
         self.style.configure("TCombobox", font=("Segoe UI", 10))
-        self.style.configure("TProgressbar", thickness=15)
+        self.style.configure("TProgressbar", thickness=18)
 
         # 主框架
         main_frame = ttk.Frame(root, padding="15 15 15 15")
@@ -62,7 +72,7 @@ class E01ConverterApp:
             "Other 64-bit", "Other 32-bit"
         ]
         self.os_type_var = tk.StringVar(root)
-        self.os_type_var.set(self.os_type_options[0]) # 默认值
+        self.os_type_var.set(self.os_type_options[0])
         self.os_type_menu = ttk.Combobox(vm_config_frame, textvariable=self.os_type_var,
                                          values=self.os_type_options, state="readonly", width=30)
         self.os_type_menu.grid(row=0, column=1, padx=5, pady=5, sticky=tk.W)
@@ -71,38 +81,68 @@ class E01ConverterApp:
         ttk.Label(vm_config_frame, text="启动方式:").grid(row=1, column=0, padx=5, pady=5, sticky=tk.W)
         self.boot_type_options = ["BIOS", "EFI (UEFI)"]
         self.boot_type_var = tk.StringVar(root)
-        self.boot_type_var.set(self.boot_type_options[0]) # 默认值
+        self.boot_type_var.set(self.boot_type_options[0])
         self.boot_type_menu = ttk.Combobox(vm_config_frame, textvariable=self.boot_type_var,
                                            values=self.boot_type_options, state="readonly", width=30)
         self.boot_type_menu.grid(row=1, column=1, padx=5, pady=5, sticky=tk.W)
 
         # 转换按钮
         self.convert_button = ttk.Button(main_frame, text="开始转换", command=self.start_conversion, style="TButton")
-        self.convert_button.pack(pady=20, ipadx=20, ipady=10)
+        self.convert_button.pack(pady=15, ipadx=20, ipady=8)
+
+        # --- 进度区域 ---
+        progress_frame = ttk.Frame(main_frame)
+        progress_frame.pack(fill=tk.X, pady=5)
+
+        # 状态文字
+        self.status_var = tk.StringVar(value="就绪")
+        self.status_label = ttk.Label(progress_frame, textvariable=self.status_var,
+                                      font=("Segoe UI", 9, "bold"), foreground="#333333")
+        self.status_label.pack(anchor=tk.W)
 
         # 进度条
-        self.progress_bar = ttk.Progressbar(main_frame, orient="horizontal", length=500, mode="determinate", style="TProgressbar")
-        self.progress_bar.pack(pady=10)
+        self.progress_bar = ttk.Progressbar(progress_frame, orient="horizontal",
+                                            length=550, mode="determinate", style="TProgressbar")
+        self.progress_bar.pack(fill=tk.X, pady=(2, 0))
+
+        # 进度百分比文字
+        self.progress_pct_var = tk.StringVar(value="")
+        self.progress_pct_label = ttk.Label(progress_frame, textvariable=self.progress_pct_var,
+                                            font=("Consolas", 8), foreground="#666666", anchor=tk.E)
+        self.progress_pct_label.pack(fill=tk.X)
 
         # 日志输出
         log_frame = ttk.LabelFrame(main_frame, text="日志输出", padding="10")
-        log_frame.pack(fill=tk.BOTH, expand=True, pady=10)
+        log_frame.pack(fill=tk.BOTH, expand=True, pady=5)
 
-        self.log_text = tk.Text(log_frame, height=8, state="disabled", font=("Consolas", 9), bg="#f0f0f0")
+        self.log_text = tk.Text(log_frame, height=7, state="disabled", font=("Consolas", 9), bg="#f0f0f0", wrap=tk.WORD)
         self.log_text.pack(fill=tk.BOTH, expand=True)
         self.log_text_scrollbar = ttk.Scrollbar(self.log_text, command=self.log_text.yview)
         self.log_text_scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
         self.log_text.config(yscrollcommand=self.log_text_scrollbar.set)
 
-        self.initial_dir_set = False # 标记是否已设置初始输出目录
+        self.initial_dir_set = False
+        self._cancel_flag = False
 
     def log_message(self, message):
         """向日志框输出信息"""
         self.log_text.config(state="normal")
         self.log_text.insert(tk.END, message + "\n")
-        self.log_text.see(tk.END) # 自动滚动到底部
+        self.log_text.see(tk.END)
         self.log_text.config(state="disabled")
-        self.root.update_idletasks() # 立即更新GUI
+        self.root.update_idletasks()
+
+    def set_status(self, text, progress_pct=None):
+        """更新状态文字和进度百分比"""
+        self.status_var.set(text)
+        if progress_pct is not None:
+            self.progress_pct_var.set(f"{progress_pct:.1f}%")
+        self.root.update_idletasks()
+
+    def update_progress(self, current_value):
+        """更新进度条数值"""
+        self.progress_bar["value"] = current_value
+        self.root.update_idletasks()
 
     def browse_e01_file(self):
         """选择E01文件"""
@@ -113,7 +153,6 @@ class E01ConverterApp:
         if file_path:
             self.e01_path_entry.delete(0, tk.END)
             self.e01_path_entry.insert(0, file_path)
-            # 自动设置输出目录为E01文件所在目录
             if not self.initial_dir_set:
                 output_dir = Path(file_path).parent
                 self.output_dir_entry.delete(0, tk.END)
@@ -128,47 +167,102 @@ class E01ConverterApp:
             self.output_dir_entry.insert(0, dir_path)
             self.initial_dir_set = True
 
-    def run_command(self, command, description, input_data=None, cwd=None):
-        """执行外部命令并记录日志，支持传入输入数据"""
+    def run_command_live(self, command, description, cwd=None, input_data=None,
+                         progress_range=(0, 100), progress_parser=None):
+        """
+        实时执行外部命令，边执行边读取输出，解析进度信息。
+
+        Args:
+            command: 命令列表
+            description: 描述文字
+            cwd: 工作目录
+            input_data: 发送到 stdin 的文本（字符串）
+            progress_range: (起始进度, 结束进度)，用于映射到总进度条
+            progress_parser: 函数(line) -> 该行解析出的进度百分比(0-100) 或 None
+        Returns:
+            bool: 是否成功
+        """
         self.log_message(f"--- 正在执行: {description} ---")
         self.log_message(f"命令: {' '.join(command)}")
+        self.set_status(description)
+
+        base_start, base_end = progress_range
+        progress_span = base_end - base_start
+
         try:
             process = subprocess.Popen(
                 command,
-                stdin=subprocess.PIPE,  # 允许写入标准输入
-                stdout=subprocess.PIPE, # 捕获标准输出
-                stderr=subprocess.PIPE, # 捕获标准错误
-                text=True,              # 以文本模式处理输入输出
-                encoding='utf-8',       # 尝试使用UTF-8编码，如果不行再尝试gbk
-                errors='replace',       # 编码错误时替换字符
-                cwd=cwd                 # 设置工作目录
+                stdin=subprocess.PIPE,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                cwd=cwd,
+                bufsize=1,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
             )
 
-            # 写入输入数据（如果有）
-            stdout, stderr = process.communicate(input=input_data)
+            # 如果有输入数据，写入 stdin 并关闭
+            if input_data:
+                process.stdin.write(input_data)
+            process.stdin.close()
+
+            stdout_lines = []
+            stderr_lines = []
+            lock = threading.Lock()
+
+            def read_stream(stream, lines_list):
+                for line in iter(stream.readline, ''):
+                    with lock:
+                        lines_list.append(line)
+                        stripped = line.rstrip('\n\r')
+                        if stripped:
+                            self.log_message(f"  {stripped}")
+                        # 尝试解析进度
+                        if progress_parser:
+                            try:
+                                pct = progress_parser(stripped)
+                                if pct is not None:
+                                    mapped = base_start + progress_span * pct / 100.0
+                                    self.update_progress(mapped)
+                                    self.set_status(description, progress_pct=mapped)
+                            except Exception:
+                                pass
+                stream.close()
+
+            stdout_thread = threading.Thread(target=read_stream, args=(process.stdout, stdout_lines))
+            stderr_thread = threading.Thread(target=read_stream, args=(process.stderr, stderr_lines))
+            stdout_thread.daemon = True
+            stderr_thread.daemon = True
+            stdout_thread.start()
+            stderr_thread.start()
+
+            stdout_thread.join()
+            stderr_thread.join()
+            process.wait()
+
+            stdout = ''.join(stdout_lines)
+            stderr = ''.join(stderr_lines)
 
             if process.returncode != 0:
                 self.log_message(f"错误: {description} 命令执行失败，返回码 {process.returncode}")
-                self.log_message("标准输出:\n" + stdout)
-                self.log_message("标准错误:\n" + stderr)
-                # 尝试用gbk再次解码stderr，因为有些工具可能默认gbk
-                try:
-                    # 注意：这里是将已解码的字符串重新编码成UTF-8字节，再解码成GBK字符串
-                    # 更好的方法是直接尝试不同的解码方式，但因为原始subprocess.run的编码问题，这里保持一致
-                    stderr_gbk = stderr.encode('utf-8').decode('gbk', errors='replace')
-                    if stderr_gbk != stderr: # 如果gbk解码不同，说明可能是编码问题
-                         self.log_message("标准错误 (GBK 解码尝试):\n" + stderr_gbk)
-                except Exception:
-                    pass
-
+                if stdout.strip():
+                    self.log_message("标准输出:\n" + stdout)
+                if stderr.strip():
+                    self.log_message("标准错误:\n" + stderr)
+                    # 尝试 gbk 解码
+                    try:
+                        stderr_gbk = stderr.encode('utf-8').decode('gbk', errors='replace')
+                        if stderr_gbk != stderr:
+                            self.log_message("标准错误 (GBK 解码尝试):\n" + stderr_gbk)
+                    except Exception:
+                        pass
                 messagebox.showerror("错误", f"{description} 失败！\n请检查日志获取详情。")
                 return False
             else:
                 self.log_message("命令执行成功！")
-                self.log_message("标准输出:\n" + stdout)
-                if stderr:
-                    self.log_message("标准错误 (可能包含信息，非错误):\n" + stderr)
                 return True
+
         except FileNotFoundError:
             self.log_message(f"错误: 找不到 {command[0]}。请检查配置中的工具路径是否正确。")
             messagebox.showerror("错误", f"找不到 {command[0]}。\n请检查配置中的工具路径是否正确。")
@@ -180,7 +274,6 @@ class E01ConverterApp:
 
     def generate_vmx_content(self, vmdk_filename, os_type_selected, boot_type_selected):
         """根据选择生成VMX文件内容"""
-        # 将用户友好的OS类型映射到VMware的guestOS标识符
         os_type_map = {
             "Windows 10 64-bit": "windows9-64",
             "Windows 8 64-bit": "windows8-64",
@@ -188,77 +281,79 @@ class E01ConverterApp:
             "Windows XP 32-bit": "winxp",
             "Windows 2003 Server 32-bit": "winnetstandard",
             "Ubuntu 64-bit": "ubuntu-64",
-            "Debian 64-bit": "debian9-64", # 较新的Debian
-            "CentOS 64-bit": "centos7-64", # 较新的CentOS
+            "Debian 64-bit": "debian9-64",
+            "CentOS 64-bit": "centos7-64",
             "Other Linux 64-bit": "otherlinux-64",
             "Other 64-bit": "other-64",
             "Other 32-bit": "other"
         }
         vmware_guest_os = os_type_map.get(os_type_selected, "other-64")
 
-        # 根据启动方式设置firmware
         firmware_setting = ""
         if boot_type_selected == "EFI (UEFI)":
             firmware_setting = "firmware = \"efi\""
 
-        # VMX 模板
-        # 提供了常见的配置，您可以根据需要进行调整
         vmx_content = f"""
 .encoding = "GBK"
 config.version = "8"
-virtualHW.version = "17" # 可以是 10, 11, 12, 14, 15, 16, 17 (对应不同VMware版本)
+virtualHW.version = "17"
 vmci0.present = "TRUE"
-memsize = "4096" # 内存大小，单位MB
-numvcpus = "2"   # CPU核心数
-displayName = "{Path(vmdk_filename).stem}_converted_vm" # 虚拟机显示名称
-guestOS = "{vmware_guest_os}" # 操作系统类型
+memsize = "4096"
+numvcpus = "2"
+displayName = "{Path(vmdk_filename).stem}_converted_vm"
+guestOS = "{vmware_guest_os}"
 
-{firmware_setting} # UEFI 或 BIOS 设置
+{firmware_setting}
 
-# 硬盘
 ide0:0.fileName = "{vmdk_filename}"
 ide0:0.present = "TRUE"
-ide0:0.redo = "" # 如果您希望保留快照功能，可以移除此行或设置为"auto"
-# scsi0:0.fileName = "{vmdk_filename}" # 如果是SCSI磁盘，请使用此行并注释掉IDE行
-# scsi0:0.present = "TRUE"
-# scsi0:0.redo = ""
-# scsi0.virtualDev = "lsilogic" # LSI Logic for SCSI
+ide0:0.redo = ""
 
-# 网络适配器 (NAT模式)
 ethernet0.present = "TRUE"
 ethernet0.connectionType = "nat"
-ethernet0.virtualDev = "e1000" # 或 "vmxnet3" 获取更好性能 (需要安装VMware Tools)
+ethernet0.virtualDev = "e1000"
 ethernet0.wakeOnPcktRcv = "FALSE"
 
-# USB 控制器
 usb.present = "TRUE"
 usb.autoConnect.enabled = "TRUE"
 
-# 声音
 sound.present = "TRUE"
 sound.virtualDev = "hdaudio"
 
-# CD/DVD 驱动器 (自动检测物理驱动器)
 ide1:0.present = "TRUE"
 ide1:0.deviceType = "atapi-cdrom"
 ide1:0.startConnected = "FALSE"
 ide1:0.autodetect = "TRUE"
 
-# 其他设置
-isolation.tools.hgfs.disable = "TRUE" # 禁用共享文件夹，提高安全性
-mks.enable3d = "TRUE" # 启用3D加速
-bios.bootdelay = "2000" # 启动时延迟2秒，方便进入BIOS/EFI设置
+isolation.tools.hgfs.disable = "TRUE"
+mks.enable3d = "TRUE"
+bios.bootdelay = "2000"
 
-# 工具
 tools.syncTime = "TRUE"
 tools.upgrade.policy = "manual"
 
-# 快照 (如果不需要快照，可以禁用)
 snapshot.action = "autoCommit"
 snapshot.numSnapshots = "0"
 
 """
         return vmx_content.strip()
+
+    def parse_ewf_progress(self, line):
+        """解析 ewfexport 的进度行，例如: 'Progress: 45%' 或 '45%'"""
+        m = re.search(r'Progress\s*:\s*(\d+)', line, re.IGNORECASE)
+        if m:
+            return float(m.group(1))
+        m = re.search(r'(\d+)\s*%', line)
+        if m:
+            return float(m.group(1))
+        return None
+
+    def parse_qemu_progress(self, line):
+        """解析 qemu-img -p 的进度行，例如: '(45.00/100.00)' 或 '(45.00/100.00%)'"""
+        m = re.search(r'\((\d+\.?\d*)\s*/\s*100\.?\d*\)', line)
+        if m:
+            return float(m.group(1))
+        return None
 
     def start_conversion(self):
         """开始整个转换流程"""
@@ -284,56 +379,61 @@ snapshot.numSnapshots = "0"
         output_dir = Path(output_dir_str)
         output_dir.mkdir(parents=True, exist_ok=True)
 
-        # 基于E01文件名生成中间RAW和最终VMDK的文件名
-        base_name = e01_path.stem # 获取不带扩展名的文件名
-        raw_path = output_dir / f"{base_name}.raw" # 完整的raw文件路径
+        base_name = e01_path.stem
+        raw_path = output_dir / f"{base_name}.raw"
         vmdk_path = output_dir / f"{base_name}.vmdk"
         vmx_path = output_dir / f"{base_name}.vmx"
 
         self.log_text.config(state="normal")
-        self.log_text.delete(1.0, tk.END) # 清空日志
+        self.log_text.delete(1.0, tk.END)
         self.log_text.config(state="disabled")
         self.log_message("--- 开始转换流程 ---")
         self.progress_bar["value"] = 0
-        self.convert_button.config(state="disabled") # 禁用按钮防止重复点击
+        self.progress_pct_var.set("0.0%")
+        self.set_status("就绪")
+        self.convert_button.config(state="disabled")
 
         try:
-            # 1. 调用 ewfexport.exe 将 E01 转换为 RAW
-            self.log_message(f"阶段1/3: 正在将 E01 转换为 RAW ({raw_path})...")
-            # ewfexport 的输入数据：
-            # 1. 格式选择 (raw) - 直接回车，因为 -f raw 已经指定
-            # 2. 目标文件名 (Windows_Server) - raw_path.stem
-            # 3. 段大小 (0 B) - 回车
-            # 4. 起始偏移 (0) - 回车
-            # 5. 导出字节数 (全部) - 回车
-            ewf_input_data = f"\n{raw_path.stem}\n\n\n\n" # 5个换行符
-
+            # ====== 阶段1: E01 → RAW ======
+            ewf_input_data = f"\n{raw_path.stem}\n\n\n\n"
             ewf_command = [
                 EWFEXPORT_PATH,
                 str(e01_path),
-                "-f", "raw",  # 指定输出格式为 raw
-                # 注意：这里不再包含 -o 参数，我们将通过 stdin 提供文件名
+                "-f", "raw",
             ]
-            # 运行 ewfexport，并将工作目录设置为输出目录，同时提供输入数据
-            if not self.run_command(ewf_command, "E01 到 RAW 转换", input_data=ewf_input_data, cwd=output_dir):
+            if not self.run_command_live(
+                ewf_command, "阶段1/3: E01 → RAW 导出中...",
+                cwd=output_dir,
+                input_data=ewf_input_data,
+                progress_range=(0, 40),
+                progress_parser=self.parse_ewf_progress,
+            ):
                 raise Exception("E01 转换失败")
-            self.progress_bar["value"] = 33
+            self.update_progress(40)
+            self.set_status("阶段1/3: E01 → RAW 完成", progress_pct=40.0)
 
-            # 2. 调用 qemu-img.exe 将 RAW 转换为 VMDK
-            self.log_message(f"阶段2/3: 正在将 RAW 转换为 VMDK ({vmdk_path})...")
+            # ====== 阶段2: RAW → VMDK ======
             qemu_command = [
                 QEMU_IMG_PATH,
                 "convert",
+                "-p",                # 启用进度显示
                 "-f", "raw",
                 "-O", "vmdk",
                 str(raw_path),
-                str(vmdk_path)
+                str(vmdk_path),
             ]
-            if not self.run_command(qemu_command, "RAW 到 VMDK 转换"):
+            if not self.run_command_live(
+                qemu_command, "阶段2/3: RAW → VMDK 转换中...",
+                cwd=output_dir,
+                progress_range=(40, 85),
+                progress_parser=self.parse_qemu_progress,
+            ):
                 raise Exception("RAW 转换失败")
-            self.progress_bar["value"] = 66
+            self.update_progress(85)
+            self.set_status("阶段2/3: RAW → VMDK 完成", progress_pct=85.0)
 
-            # 3. 生成 VMX 文件
+            # ====== 阶段3: 生成 VMX ======
+            self.set_status("阶段3/3: 正在生成 VMX 文件...", progress_pct=85.0)
             self.log_message(f"阶段3/3: 正在生成 VMX 文件 ({vmx_path})...")
             vmx_content = self.generate_vmx_content(vmdk_path.name, os_type_selected, boot_type_selected)
             try:
@@ -343,9 +443,11 @@ snapshot.numSnapshots = "0"
             except Exception as e:
                 self.log_message(f"错误: 生成 VMX 文件失败: {e}")
                 raise Exception("VMX 生成失败")
-            self.progress_bar["value"] = 90
+            self.update_progress(90)
+            self.set_status("VMX 生成完成", progress_pct=90.0)
 
-            # 4. 删除中间产物 RAW 文件
+            # ====== 阶段4: 清理中间 RAW 文件 ======
+            self.set_status("正在清理中间文件...", progress_pct=90.0)
             self.log_message(f"正在删除中间产物 RAW 文件 ({raw_path})...")
             try:
                 os.remove(raw_path)
@@ -353,7 +455,8 @@ snapshot.numSnapshots = "0"
             except OSError as e:
                 self.log_message(f"警告: 删除 RAW 文件失败: {e}")
                 messagebox.showwarning("警告", f"删除中间产物 RAW 文件失败。\n请手动删除: {raw_path}")
-            self.progress_bar["value"] = 100
+            self.update_progress(100)
+            self.set_status("全部完成 ✓", progress_pct=100.0)
 
             self.log_message("--- 所有操作完成！ ---")
             messagebox.showinfo("完成", f"E01 文件已成功转换为 VMDK，并生成 VMX 文件！\n\nVMDK: {vmdk_path}\nVMX: {vmx_path}")
@@ -361,8 +464,10 @@ snapshot.numSnapshots = "0"
         except Exception as e:
             self.log_message(f"流程中断: {e}")
             self.log_message("--- 转换流程失败 ---")
+            self.set_status("转换失败", progress_pct=0)
         finally:
-            self.convert_button.config(state="normal") # 重新启用按钮
+            self.convert_button.config(state="normal")
+
 
 if __name__ == "__main__":
     root = tk.Tk()
