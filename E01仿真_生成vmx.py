@@ -355,6 +355,86 @@ snapshot.numSnapshots = "0"
             return float(m.group(1))
         return None
 
+    # ---------- 磁盘空间检查 ----------
+
+    def get_ewf_media_size(self, e01_path):
+        """
+        用 ewfinfo 读取 E01 镜像的原始大小（解压后的完整尺寸）。
+        返回: (bytes_size, size_human)，失败返回 None
+        """
+        self.log_message(f"正在分析 E01 镜像信息 ({e01_path})...")
+        try:
+            proc = subprocess.Popen(
+                [EWFEXPORT_PATH.replace("ewfexport", "ewfinfo"), str(e01_path)],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+                encoding='utf-8',
+                errors='replace',
+            )
+            stdout, stderr = proc.communicate(timeout=30)
+            if proc.returncode != 0:
+                self.log_message(f"ewfinfo 执行失败 (返回码 {proc.returncode})，跳过空间检查")
+                self.log_message("标准错误:\n" + stderr)
+                return None
+
+            # 解析 "Media size:  XXX bytes" 行
+            # 典型格式: "Media size:               10.0 GB (10737418240 bytes)"
+            for line in stdout.splitlines():
+                m = re.search(r'Media\s+size.*?\((\d+)\s+bytes\)', line, re.IGNORECASE)
+                if m:
+                    size_bytes = int(m.group(1))
+                    # 格式化可读大小
+                    for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+                        if size_bytes < 1024:
+                            size_human = f"{size_bytes:.1f} {unit}"
+                            break
+                        size_human = f"{size_bytes / 1024:.1f} {unit}"
+                        size_bytes //= 1024
+                    actual_bytes = int(m.group(1))
+                    return actual_bytes, size_human
+            self.log_message("未能从 ewfinfo 输出中解析到 Media size 信息，跳过空间检查")
+            return None
+        except subprocess.TimeoutExpired:
+            self.log_message("ewfinfo 超时，跳过空间检查")
+            return None
+        except Exception as e:
+            self.log_message(f"获取 E01 尺寸信息失败: {e}，跳过空间检查")
+            return None
+
+    def check_disk_space(self, media_size_bytes, output_dir):
+        """
+        检查目标磁盘是否有足够空间。
+        需要足够存放 RAW + VMDK（约 media_size * 1.2 作为冗余）。
+        返回: (ok, free_bytes, free_human, need_human)
+        """
+        try:
+            usage = shutil.disk_usage(output_dir)
+            free_bytes = usage.free
+
+            # 需要空间 = media_size * 1.2（RAW + VMDK + 冗余）
+            need_bytes = int(media_size_bytes * 1.2)
+
+            # 格式化可读大小
+            def fmt_size(b):
+                for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
+                    if b < 1024:
+                        return f"{b:.1f} {unit}"
+                    b /= 1024
+                return f"{b:.1f} PB"
+
+            free_human = fmt_size(usage.free)
+            need_human = fmt_size(need_bytes)
+            media_human = fmt_size(media_size_bytes)
+
+            ok = usage.free >= need_bytes
+            return ok, usage.free, free_human, need_human, media_human
+        except Exception as e:
+            self.log_message(f"检查磁盘空间失败: {e}，跳过空间检查")
+            return True, 0, "未知", "未知", "未知"
+
+    # ---------- 转换主流程 ----------
+
     def start_conversion(self):
         """开始整个转换流程"""
         e01_path_str = self.e01_path_entry.get().strip()
@@ -384,10 +464,38 @@ snapshot.numSnapshots = "0"
         vmdk_path = output_dir / f"{base_name}.vmdk"
         vmx_path = output_dir / f"{base_name}.vmx"
 
+        # ====== 磁盘空间预检查 ======
         self.log_text.config(state="normal")
         self.log_text.delete(1.0, tk.END)
         self.log_text.config(state="disabled")
         self.log_message("--- 开始转换流程 ---")
+
+        media_info = self.get_ewf_media_size(e01_path)
+        if media_info is not None:
+            media_bytes, media_human = media_info
+            ok, free_bytes, free_human, need_human, _ = self.check_disk_space(media_bytes, output_dir)
+            if not ok:
+                msg = (
+                    f"⚠ 磁盘空间不足！\n\n"
+                    f"E01 镜像解压后大小: {media_human}\n"
+                    f"预估所需空间: {need_human}\n"
+                    f"目标磁盘剩余: {free_human}\n\n"
+                    f"转换过程中会先生成 RAW 文件再转为 VMDK，\n"
+                    f"建议至少有 {need_human} 的可用空间。\n\n"
+                    f"是否仍然继续？"
+                )
+                self.log_message(f"⚠ 空间预警: E01解压大小={media_human}, 预估需要={need_human}, 磁盘剩余={free_human}")
+                if not messagebox.askyesno("空间不足警告", msg, icon="warning"):
+                    self.log_message("用户取消转换")
+                    self.set_status("已取消")
+                    return
+                else:
+                    self.log_message("用户选择忽略警告，继续转换")
+            else:
+                self.log_message(f"✓ 磁盘空间充足: E01解压大小={media_human}, 预估需要={need_human}, 磁盘剩余={free_human}")
+        else:
+            self.log_message("无法获取 E01 镜像尺寸信息，跳过空间检查")
+
         self.progress_bar["value"] = 0
         self.progress_pct_var.set("0.0%")
         self.set_status("就绪")
